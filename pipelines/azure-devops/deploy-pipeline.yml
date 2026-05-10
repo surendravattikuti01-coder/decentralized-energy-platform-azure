@@ -1,0 +1,297 @@
+# ============================================================
+# Azure DevOps Pipeline - Decentralized Energy Platform
+# Provisions Tesla Megapack + Azure Energy Management infra
+# Stages: Validate → Security → Plan → Deploy Dev → Deploy Prod
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop, release/*]
+  paths:
+    exclude: [docs/**, '*.md']
+
+pr:
+  branches:
+    include: [main]
+
+parameters:
+  - name: environment
+    displayName: Target Environment
+    type: string
+    default: dev
+    values: [dev, staging, prod]
+  - name: action
+    displayName: Terraform Action
+    type: string
+    default: plan
+    values: [plan, apply, destroy]
+  - name: forceApply
+    displayName: Force Apply (skip approval)
+    type: boolean
+    default: false
+
+variables:
+  - group: energy-platform-secrets
+  - name: TF_VERSION
+    value: '1.6.4'
+  - name: AZURE_REGION
+    value: 'eastus2'
+  - name: ARM_USE_OIDC
+    value: 'true'
+  - name: TF_IN_AUTOMATION
+    value: 'true'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+# ─────────────────────────────────────────────────────────
+# Stage 1: Security & Compliance Scanning
+# ─────────────────────────────────────────────────────────
+- stage: SecurityScan
+  displayName: 'Security & Compliance Scan'
+  jobs:
+  - job: TerraformScan
+    displayName: 'Scan Terraform IaC'
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.11'
+
+    - script: |
+        pip install checkov
+        checkov -d infrastructure/terraform           --framework terraform           --output sarif           --output-file-path checkov.sarif           --compact           --soft-fail
+      displayName: 'Checkov IaC Security Scan'
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        pathToPublish: checkov.sarif
+        artifactName: security-reports
+
+    - script: |
+        curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+        tfsec infrastructure/terraform           --format sarif           --out tfsec.sarif           --minimum-severity HIGH
+      displayName: 'tfsec Vulnerability Scan'
+
+    - script: |
+        pip install detect-secrets
+        detect-secrets scan --all-files > .secrets.baseline
+        detect-secrets audit .secrets.baseline
+      displayName: 'Secret Detection Scan'
+
+  - job: ComplianceCheck
+    displayName: 'NERC CIP & ISO 27001 Compliance'
+    steps:
+    - checkout: self
+    - script: |
+        pip install azure-mgmt-policyinsights azure-identity
+        python scripts/compliance_check.py           --framework NERC_CIP           --framework ISO_27001           --output compliance-report.json
+      displayName: 'Run Compliance Checks'
+      env:
+        AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+        AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+        AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+
+# ─────────────────────────────────────────────────────────
+# Stage 2: Terraform Validate & Plan
+# ─────────────────────────────────────────────────────────
+- stage: TerraformPlan
+  displayName: 'Terraform Plan'
+  dependsOn: SecurityScan
+  condition: succeeded()
+  jobs:
+  - job: Plan
+    displayName: 'Terraform Plan - ${{ parameters.environment }}'
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: $(TF_VERSION)
+
+    - task: AzureCLI@2
+      displayName: 'Configure OIDC Authentication'
+      inputs:
+        azureSubscription: 'energy-platform-${{ parameters.environment }}'
+        scriptType: bash
+        addSpnToEnvironment: true
+        scriptLocation: inlineScript
+        inlineScript: |
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_TENANT_ID=$tenantId
+          export ARM_USE_OIDC=true
+          export ARM_OIDC_TOKEN=$idToken
+          echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$ARM_CLIENT_ID"
+          echo "##vso[task.setvariable variable=ARM_TENANT_ID]$ARM_TENANT_ID"
+          echo "##vso[task.setvariable variable=ARM_OIDC_TOKEN]$ARM_OIDC_TOKEN"
+
+    - script: |
+        cd infrastructure/terraform/environments/${{ parameters.environment }}
+        terraform init           -backend-config="resource_group_name=$(TF_STATE_RG)"           -backend-config="storage_account_name=$(TF_STATE_STORAGE)"           -backend-config="container_name=tfstate"           -backend-config="key=${{ parameters.environment }}/energy-platform.tfstate"           -reconfigure
+      displayName: 'Terraform Init'
+      env:
+        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+        ARM_TENANT_ID: $(ARM_TENANT_ID)
+        ARM_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+        ARM_USE_OIDC: $(ARM_USE_OIDC)
+
+    - script: |
+        cd infrastructure/terraform/environments/${{ parameters.environment }}
+        terraform validate
+        terraform fmt -check -recursive
+      displayName: 'Terraform Validate & Format'
+
+    - script: |
+        cd infrastructure/terraform/environments/${{ parameters.environment }}
+        terraform plan           -var-file="terraform.tfvars"           -var="environment=${{ parameters.environment }}"           -out=tfplan.bin           -detailed-exitcode           -no-color 2>&1 | tee plan_output.txt
+        echo "##vso[task.setvariable variable=PLAN_EXIT_CODE;isOutput=true]$?"
+      displayName: 'Terraform Plan'
+      name: terraformPlan
+      env:
+        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+        ARM_TENANT_ID: $(ARM_TENANT_ID)
+        ARM_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+        ARM_USE_OIDC: $(ARM_USE_OIDC)
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: infrastructure/terraform/environments/${{ parameters.environment }}
+        artifactName: tfplan-${{ parameters.environment }}
+      displayName: 'Publish Plan Artifact'
+
+    - task: GitHubComment@0
+      condition: eq(variables['Build.Reason'], 'PullRequest')
+      inputs:
+        gitHubConnection: energy-platform-github
+        repositoryName: $(Build.Repository.Name)
+        id: $(System.PullRequest.PullRequestNumber)
+        comment: |
+          ## Terraform Plan - ${{ parameters.environment }}
+
+          ```
+          $(cat infrastructure/terraform/environments/${{ parameters.environment }}/plan_output.txt | tail -20)
+          ```
+
+# ─────────────────────────────────────────────────────────
+# Stage 3: Deploy to Dev (Automatic)
+# ─────────────────────────────────────────────────────────
+- stage: DeployDev
+  displayName: 'Deploy to Dev'
+  dependsOn: TerraformPlan
+  condition: |
+    and(
+      succeeded(),
+      or(
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop'),
+        eq('${{ parameters.action }}', 'apply')
+      )
+    )
+  jobs:
+  - deployment: DeployDev
+    displayName: 'Deploy Energy Platform - Dev'
+    environment: energy-platform-dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              artifactName: tfplan-dev
+              downloadPath: infrastructure/terraform/environments/dev
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Apply - Dev'
+            inputs:
+              azureSubscription: 'energy-platform-dev'
+              scriptType: bash
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                cd infrastructure/terraform/environments/dev
+                terraform init                   -backend-config="resource_group_name=$(TF_STATE_RG)"                   -backend-config="storage_account_name=$(TF_STATE_STORAGE)"                   -backend-config="container_name=tfstate"                   -backend-config="key=dev/energy-platform.tfstate"
+                terraform apply -auto-approve tfplan.bin
+              env:
+                ARM_CLIENT_ID: $servicePrincipalId
+                ARM_TENANT_ID: $tenantId
+                ARM_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+                ARM_USE_OIDC: 'true'
+                ARM_OIDC_TOKEN: $idToken
+
+          - script: |
+              python scripts/smoke_test.py --environment dev --timeout 300
+            displayName: 'Run Smoke Tests'
+
+# ─────────────────────────────────────────────────────────
+# Stage 4: Deploy to Production (Manual Approval Gate)
+# ─────────────────────────────────────────────────────────
+- stage: DeployProd
+  displayName: 'Deploy to Production'
+  dependsOn: DeployDev
+  condition: |
+    and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main')
+    )
+  jobs:
+  - deployment: DeployProd
+    displayName: 'Deploy Energy Platform - Production'
+    environment: energy-platform-prod  # Has approval gate configured in Azure DevOps
+    timeoutInMinutes: 60
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              artifactName: tfplan-prod
+              downloadPath: infrastructure/terraform/environments/prod
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Apply - Production'
+            inputs:
+              azureSubscription: 'energy-platform-prod'
+              scriptType: bash
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                cd infrastructure/terraform/environments/prod
+                terraform init                   -backend-config="resource_group_name=$(TF_STATE_RG_PROD)"                   -backend-config="storage_account_name=$(TF_STATE_STORAGE_PROD)"                   -backend-config="container_name=tfstate"                   -backend-config="key=prod/energy-platform.tfstate"
+                terraform apply -auto-approve tfplan.bin
+              env:
+                ARM_CLIENT_ID: $servicePrincipalId
+                ARM_TENANT_ID: $tenantId
+                ARM_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID_PROD)
+                ARM_USE_OIDC: 'true'
+                ARM_OIDC_TOKEN: $idToken
+
+          - script: |
+              python scripts/smoke_test.py --environment prod --timeout 600
+            displayName: 'Production Smoke Tests'
+
+          - task: SendEmail@1
+            condition: always()
+            inputs:
+              To: 'platform-team@example.com'
+              From: 'devops-noreply@example.com'
+              Subject: '[Energy Platform] Production Deploy $(Agent.JobStatus)'
+              Body: |
+                Production deployment $(Agent.JobStatus)
+                Build: $(Build.BuildNumber)
+                Commit: $(Build.SourceVersion)
+                By: $(Build.RequestedFor)
